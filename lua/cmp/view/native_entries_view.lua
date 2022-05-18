@@ -77,7 +77,7 @@ native_entries_view.open = function(self, offset, entries)
 end
 
 native_entries_view.close = function(self)
-  if api.is_suitable_mode() then
+  if api.is_suitable_mode() and self:visible() then
     vim.fn.complete(1, {})
     vim.api.nvim_select_popupmenu_item(-1, false, true, {})
   end
@@ -101,7 +101,7 @@ native_entries_view.info = function(self)
   if self:visible() then
     local info = vim.fn.pum_getpos()
     return {
-      width = info.width + (info.scrollbar and 1 or 0),
+      width = info.width + (info.scrollable and 1 or 0),
       height = info.height,
       row = info.row,
       col = info.col,
@@ -118,23 +118,43 @@ native_entries_view.preselect = function(self, index)
 end
 
 native_entries_view.select_next_item = function(self, option)
+  local callback = function()
+    self.event:emit('change')
+  end
   if self:visible() then
     if (option.behavior or types.cmp.SelectBehavior.Insert) == types.cmp.SelectBehavior.Insert then
-      feedkeys.call(keymap.t('<C-n>'), 'n')
+      feedkeys.call(keymap.t('<C-n>'), 'n', callback)
     else
-      feedkeys.call(keymap.t('<Down>'), 'n')
+      feedkeys.call(keymap.t('<Down>'), 'n', callback)
     end
   end
 end
 
 native_entries_view.select_prev_item = function(self, option)
+  local callback = function()
+    self.event:emit('change')
+  end
   if self:visible() then
     if (option.behavior or types.cmp.SelectBehavior.Insert) == types.cmp.SelectBehavior.Insert then
-      feedkeys.call(keymap.t('<C-p>'), 'n')
+      feedkeys.call(keymap.t('<C-p>'), 'n', callback)
     else
-      feedkeys.call(keymap.t('<Up>'), 'n')
+      feedkeys.call(keymap.t('<Up>'), 'n', callback)
     end
   end
+end
+
+native_entries_view.get_offset = function(self)
+  if self:visible() then
+    return self.offset
+  end
+  return nil
+end
+
+native_entries_view.get_entries = function(self)
+  if self:visible() then
+    return self.entries
+  end
+  return {}
 end
 
 native_entries_view.get_first_entry = function(self)

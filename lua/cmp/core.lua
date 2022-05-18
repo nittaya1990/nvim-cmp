@@ -1,4 +1,5 @@
 local debug = require('cmp.utils.debug')
+local str = require('cmp.utils.str')
 local char = require('cmp.utils.char')
 local pattern = require('cmp.utils.pattern')
 local feedkeys = require('cmp.utils.feedkeys')
@@ -14,14 +15,13 @@ local api = require('cmp.utils.api')
 local event = require('cmp.utils.event')
 
 local SOURCE_TIMEOUT = 500
-local THROTTLE_TIME = 120
-local DEBOUNCE_TIME = 20
+local DEBOUNCE_TIME = 80
+local THROTTLE_TIME = 40
 
 ---@class cmp.Core
 ---@field public suspending boolean
 ---@field public view cmp.View
 ---@field public sources cmp.Source[]
----@field public sources_by_name table<string, cmp.Source>
 ---@field public context cmp.Context
 ---@field public event cmp.Event
 local core = {}
@@ -30,12 +30,14 @@ core.new = function()
   local self = setmetatable({}, { __index = core })
   self.suspending = false
   self.sources = {}
-  self.sources_by_name = {}
   self.context = context.new()
   self.event = event.new()
   self.view = view.new()
   self.view.event:on('keymap', function(...)
     self:on_keymap(...)
+  end)
+  self.view.event:on('complete_done', function(evt)
+    self.event:emit('complete_done', evt)
   end)
   return self
 end
@@ -44,19 +46,11 @@ end
 ---@param s cmp.Source
 core.register_source = function(self, s)
   self.sources[s.id] = s
-  if not self.sources_by_name[s.name] then
-    self.sources_by_name[s.name] = {}
-  end
-  table.insert(self.sources_by_name[s.name], s)
 end
 
 ---Unregister source
 ---@param source_id string
 core.unregister_source = function(self, source_id)
-  local name = self.sources[source_id].name
-  self.sources_by_name[name] = vim.tbl_filter(function(s)
-    return s.id ~= source_id
-  end, self.sources_by_name[name])
   self.sources[source_id] = nil
 end
 
@@ -80,20 +74,30 @@ end
 ---Suspend completion
 core.suspend = function(self)
   self.suspending = true
-  return function()
+  -- It's needed to avoid conflicting with autocmd debouncing.
+  return vim.schedule_wrap(function()
     self.suspending = false
-  end
+  end)
 end
 
 ---Get sources that sorted by priority
----@param statuses cmp.SourceStatus[]
+---@param filter cmp.SourceStatus[]|fun(s: cmp.Source): boolean
 ---@return cmp.Source[]
-core.get_sources = function(self, statuses)
+core.get_sources = function(self, filter)
+  local f = function(s)
+    if type(filter) == 'table' then
+      return vim.tbl_contains(filter, s.status)
+    elseif type(filter) == 'function' then
+      return filter(s)
+    end
+    return true
+  end
+
   local sources = {}
   for _, c in pairs(config.get().sources) do
-    for _, s in ipairs(self.sources_by_name[c.name] or {}) do
-      if not statuses or vim.tbl_contains(statuses, s.status) then
-        if s:is_available() then
+    for _, s in pairs(self.sources) do
+      if c.name == s.name then
+        if s:is_available() and f(s) then
           table.insert(sources, s)
         end
       end
@@ -118,6 +122,7 @@ core.on_keymap = function(self, keys, fallback)
     local is_printable = char.is_printable(string.byte(chars, 1))
     self:confirm(e, {
       behavior = is_printable and 'insert' or 'replace',
+      commit_character = chars,
     }, function()
       local ctx = self:get_context()
       local word = e:get_word()
@@ -154,7 +159,6 @@ core.on_change = function(self, trigger_event)
     self:get_context({ reason = types.cmp.ContextReason.Auto })
     return
   end
-
   self:autoindent(trigger_event, function()
     local ctx = self:get_context({ reason = types.cmp.ContextReason.Auto })
     debug.log(('ctx: `%s`'):format(ctx.cursor_before_line))
@@ -165,7 +169,7 @@ core.on_change = function(self, trigger_event)
       if vim.tbl_contains(config.get().completion.autocomplete or {}, trigger_event) then
         self:complete(ctx)
       else
-        self.filter.timeout = THROTTLE_TIME
+        self.filter.timeout = self.view:visible() and THROTTLE_TIME or 0
         self:filter()
       end
     else
@@ -204,26 +208,54 @@ core.autoindent = function(self, trigger_event, callback)
     return callback()
   end
 
-  -- Scan indentkeys.
+  -- Reset current completion if indentkeys matched.
   for _, key in ipairs(vim.split(vim.bo.indentkeys, ',')) do
     if vim.tbl_contains({ '=' .. prefix, '0=' .. prefix }, key) then
-      local release = self:suspend()
-      vim.schedule(function() -- Check autoindent already applied.
-        if cursor_before_line == api.get_cursor_before_line() then
-          feedkeys.call(keymap.autoindent(), 'n', function()
-            release()
-            callback()
-          end)
-        else
-          callback()
-        end
-      end)
-      return
+      self:reset()
+      self:set_context(context.empty())
+      break
     end
   end
 
-  -- indentkeys does not matched.
   callback()
+end
+
+---Complete common string for current completed entries.
+core.complete_common_string = function(self)
+  if not self.view:visible() or self.view:get_active_entry() then
+    return false
+  end
+
+  config.set_onetime({
+    sources = config.get().sources,
+    matching = {
+      disallow_prefix_unmatching = true,
+      disallow_partial_matching = true,
+      disallow_fuzzy_matching = true,
+    },
+  })
+
+  self:filter()
+  self.filter:sync(1000)
+
+  config.set_onetime({})
+
+  local cursor = api.get_cursor()
+  local offset = self.view:get_offset()
+  local common_string
+  for _, e in ipairs(self.view:get_entries()) do
+    local vim_item = e:get_vim_item(offset)
+    if not common_string then
+      common_string = vim_item.word
+    else
+      common_string = str.get_common_string(common_string, vim_item.word)
+    end
+  end
+  if common_string and #common_string > (1 + cursor[2] - offset) then
+    feedkeys.call(keymap.backspace(string.sub(api.get_current_line(), offset, cursor[2])) .. common_string, 'n')
+    return true
+  end
+  return false
 end
 
 ---Invoke completion
@@ -232,64 +264,78 @@ core.complete = function(self, ctx)
   if not api.is_suitable_mode() then
     return
   end
+
   self:set_context(ctx)
 
-  for _, s in ipairs(self:get_sources({ source.SourceStatus.WAITING, source.SourceStatus.COMPLETED })) do
-    s:complete(
-      ctx,
-      (function(src)
-        local callback
-        callback = function()
-          local new = context.new(ctx)
-          if new:changed(new.prev_context) and ctx == self.context then
-            src:complete(new, callback)
-          else
+  -- Invoke completion sources.
+  local sources = self:get_sources()
+  for _, s in ipairs(sources) do
+    local callback
+    callback = (function(s_)
+      return function()
+        local new = context.new(ctx)
+        if s_.incomplete and new:changed(s_.context) then
+          s_:complete(new, callback)
+        else
+          if not self.view:get_active_entry() then
             self.filter.stop()
             self.filter.timeout = DEBOUNCE_TIME
             self:filter()
           end
         end
-        return callback
-      end)(s)
-    )
+      end
+    end)(s)
+    s:complete(ctx, callback)
   end
 
-  self.filter.timeout = THROTTLE_TIME
-  self:filter()
+  if not self.view:get_active_entry() then
+    self.filter.timeout = self.view:visible() and THROTTLE_TIME or 1
+    self:filter()
+  end
 end
 
 ---Update completion menu
-core.filter = async.throttle(
-  vim.schedule_wrap(function(self)
-    if not api.is_suitable_mode() then
-      return
-    end
-    if self.view:get_active_entry() ~= nil then
-      return
-    end
-    local ctx = self:get_context()
+core.filter = async.throttle(function(self)
+  self.filter.timeout = THROTTLE_TIME
 
-    -- To wait for processing source for that's timeout.
-    local sources = {}
-    for _, s in ipairs(self:get_sources({ source.SourceStatus.FETCHING, source.SourceStatus.COMPLETED })) do
-      local time = SOURCE_TIMEOUT - s:get_fetching_time()
-      if not s.incomplete and time > 0 then
-        if #sources == 0 then
-          self.filter.stop()
-          self.filter.timeout = time + 1
-          self:filter()
-          return
-        end
-        break
+  -- Check invalid condition.
+  local ignore = false
+  ignore = ignore or not api.is_suitable_mode()
+  if ignore then
+    return
+  end
+
+  -- Check fetching sources.
+  local sources = {}
+  for _, s in ipairs(self:get_sources({ source.SourceStatus.FETCHING, source.SourceStatus.COMPLETED })) do
+    -- Reserve filter call for timeout.
+    if not s.incomplete and SOURCE_TIMEOUT > s:get_fetching_time() then
+      self.filter.timeout = SOURCE_TIMEOUT - s:get_fetching_time()
+      self:filter()
+      if #sources == 0 then
+        return
       end
-      table.insert(sources, s)
     end
-    self.filter.timeout = THROTTLE_TIME
+    table.insert(sources, s)
+  end
 
-    self.view:open(ctx, sources)
-  end),
-  THROTTLE_TIME
-)
+  local ctx = self:get_context()
+
+  -- Display completion results.
+  self.view:open(ctx, sources)
+
+  -- Check onetime config.
+  if #self:get_sources(function(s)
+    if s.status == source.SourceStatus.FETCHING then
+      return true
+    elseif #s:get_entries(ctx) > 0 then
+      return true
+    end
+    return false
+  end) == 0 then
+    config.set_onetime({})
+  end
+end, THROTTLE_TIME)
 
 ---Confirm completion.
 ---@param e cmp.Entry
@@ -297,7 +343,7 @@ core.filter = async.throttle(
 ---@param callback function
 core.confirm = function(self, e, option, callback)
   if not (e and not e.confirmed) then
-    return
+    return callback()
   end
   e.confirmed = true
 
@@ -308,26 +354,32 @@ core.confirm = function(self, e, option, callback)
   -- Close menus.
   self.view:close()
 
-  -- Simulate `<C-y>` behavior.
-  async.step(function(next)
+  feedkeys.call(keymap.indentkeys(), 'n')
+  feedkeys.call('', 'n', function()
     local ctx = context.new()
-    local confirm = {}
-    table.insert(confirm, keymap.backspace(ctx.cursor.character - misc.to_utfindex(e.context.cursor_before_line, e:get_offset())))
-    table.insert(confirm, e:get_word())
-    table.insert(confirm, keymap.undobreak())
-    feedkeys.call(table.concat(confirm, ''), 'nt', next)
-
-  -- Restore to the requested state.
-  end, function(next)
-    local restore = {}
-    table.insert(restore, keymap.backspace(vim.str_utfindex(e:get_word())))
-    table.insert(restore, string.sub(e.context.cursor_before_line, e:get_offset()))
-    feedkeys.call(table.concat(restore, ''), 'n', next)
-
-  -- Async additionalTextEdits @see https://github.com/microsoft/vscode/blob/main/src/vs/editor/contrib/suggest/suggestController.ts#L334
-  end, function(next)
+    local keys = {}
+    table.insert(keys, keymap.backspace(ctx.cursor.character - misc.to_utfindex(ctx.cursor_line, e:get_offset())))
+    table.insert(keys, e:get_word())
+    table.insert(keys, keymap.undobreak())
+    feedkeys.call(table.concat(keys, ''), 'in')
+  end)
+  feedkeys.call('', 'n', function()
+    local ctx = context.new()
+    if api.is_cmdline_mode() then
+      local keys = {}
+      table.insert(keys, keymap.backspace(ctx.cursor.character - misc.to_utfindex(ctx.cursor_line, e:get_offset())))
+      table.insert(keys, string.sub(e.context.cursor_before_line, e:get_offset()))
+      feedkeys.call(table.concat(keys, ''), 'in')
+    else
+      vim.api.nvim_buf_set_text(0, ctx.cursor.row - 1, e:get_offset() - 1, ctx.cursor.row - 1, ctx.cursor.col - 1, {
+        string.sub(e.context.cursor_before_line, e:get_offset()),
+      })
+      vim.api.nvim_win_set_cursor(0, { e.context.cursor.row, e.context.cursor.col - 1 })
+    end
+  end)
+  feedkeys.call('', 'n', function()
+    local ctx = context.new()
     if #(misc.safe(e:get_completion_item().additionalTextEdits) or {}) == 0 then
-      local pre = context.new()
       e:resolve(function()
         local new = context.new()
         local text_edits = misc.safe(e:get_completion_item().additionalTextEdits) or {}
@@ -336,8 +388,8 @@ core.confirm = function(self, e, option, callback)
         end
 
         local has_cursor_line_text_edit = (function()
-          local minrow = math.min(pre.cursor.row, new.cursor.row)
-          local maxrow = math.max(pre.cursor.row, new.cursor.row)
+          local minrow = math.min(ctx.cursor.row, new.cursor.row)
+          local maxrow = math.max(ctx.cursor.row, new.cursor.row)
           for _, te in ipairs(text_edits) do
             local srow = te.range.start.line + 1
             local erow = te.range['end'].line + 1
@@ -350,15 +402,13 @@ core.confirm = function(self, e, option, callback)
         if has_cursor_line_text_edit then
           return
         end
-        vim.fn['cmp#apply_text_edits'](new.bufnr, text_edits)
+        vim.lsp.util.apply_text_edits(text_edits, ctx.bufnr, 'utf-16')
       end)
     else
-      vim.fn['cmp#apply_text_edits'](vim.api.nvim_get_current_buf(), e:get_completion_item().additionalTextEdits)
+      vim.lsp.util.apply_text_edits(e:get_completion_item().additionalTextEdits, ctx.bufnr, 'utf-16')
     end
-    next()
-
-  -- Expand completion item
-  end, function(next)
+  end)
+  feedkeys.call('', 'n', function()
     local ctx = context.new()
     local completion_item = misc.copy(e:get_completion_item())
     if not misc.safe(completion_item.textEdit) then
@@ -372,8 +422,8 @@ core.confirm = function(self, e, option, callback)
       completion_item.textEdit.range = e:get_insert_range()
     end
 
-    local diff_before = e.context.cursor.character - completion_item.textEdit.range.start.character
-    local diff_after = completion_item.textEdit.range['end'].character - e.context.cursor.character
+    local diff_before = math.max(0, e.context.cursor.character - completion_item.textEdit.range.start.character)
+    local diff_after = math.max(0, completion_item.textEdit.range['end'].character - e.context.cursor.character)
     local new_text = completion_item.textEdit.newText
 
     if api.is_insert_mode() then
@@ -385,27 +435,39 @@ core.confirm = function(self, e, option, callback)
       if is_snippet then
         completion_item.textEdit.newText = ''
       end
-      vim.fn['cmp#apply_text_edits'](ctx.bufnr, { completion_item.textEdit })
+      vim.lsp.util.apply_text_edits({ completion_item.textEdit }, ctx.bufnr, 'utf-16')
+      local texts = vim.split(completion_item.textEdit.newText, '\n')
+      local position = completion_item.textEdit.range.start
+      position.line = position.line + (#texts - 1)
+      if #texts == 1 then
+        position.character = position.character + misc.to_utfindex(texts[1])
+      else
+        position.character = misc.to_utfindex(texts[#texts])
+      end
+      local pos = types.lsp.Position.to_vim(0, position)
+      vim.api.nvim_win_set_cursor(0, { pos.row, pos.col - 1 })
       if is_snippet then
         config.get().snippet.expand({
           body = new_text,
           insert_text_mode = completion_item.insertTextMode,
         })
       end
-      next()
     else
       local keys = {}
       table.insert(keys, string.rep(keymap.t('<BS>'), diff_before))
       table.insert(keys, string.rep(keymap.t('<Del>'), diff_after))
       table.insert(keys, new_text)
-      feedkeys.call(table.concat(keys, ''), 'n', next)
+      feedkeys.call(table.concat(keys, ''), 'in')
     end
-
-  -- Finalize
-  end, function()
+  end)
+  feedkeys.call(keymap.indentkeys(vim.bo.indentkeys), 'n')
+  feedkeys.call('', 'n', function()
     e:execute(vim.schedule_wrap(function()
       release()
-      self.event:emit('confirm_done', e)
+      self.event:emit('confirm_done', {
+        entry = e,
+        commit_character = option.commit_character,
+      })
       if callback then
         callback()
       end
@@ -418,7 +480,7 @@ core.reset = function(self)
   for _, s in pairs(self.sources) do
     s:reset()
   end
-  self:get_context() -- To prevent new event
+  self.context = context.empty()
 end
 
 return core
